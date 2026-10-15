@@ -23,7 +23,7 @@ import hydra
 import ray
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
-from verl.trainer.main_ppo import run_ppo
+from verl.trainer.main_ppo import TaskRunnerV1, run_ppo
 from verl.trainer.main_ppo_v0 import BaseTaskRunner
 from verl.trainer.ppo.utils import (
     create_rl_dataset,
@@ -115,7 +115,15 @@ class DAPOTaskRunner(BaseTaskRunner):
 def main(config):
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
-    run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(DAPOTaskRunner))
+    if config.trainer.use_v1:
+        validate_config(
+            config=config,
+            use_reference_policy=need_reference_policy(config),
+            use_critic=need_critic(config),
+        )
+        run_ppo(config, task_runner_class=TaskRunnerV1)
+    else:
+        run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(DAPOTaskRunner))
 
 
 if __name__ == "__main__":
