@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# ReTool Stage 2 (Multi-Turn DAPO RL with Code Interpreter) | Qwen3-32B | TorchTitan (SimpleFSDP=4, CP=8, DEFER_NEVER) & vLLM Rollout (8 x TP=4, Raiden) | TPU v6e-32 x2 Slices
+# ReTool Stage 2 (Multi-Turn DAPO RL with Code Interpreter) | Qwen3-32B | TorchTitan (SimpleFSDP=4, CP=8, DEFER_NEVER) & vLLM Rollout (8 x TP=4, block_size=256, Raiden) | TPU v6e 2x 32-Chip Nodepools
+#
+# Optimal 32-chip vLLM rollout settings (benchmarked on xibin-v6e-8-2):
+#   - Default (8 x TP=4, block_size=256, max_num_seqs=128):
+#       * On 8 x v6e-4 (ct6e-standard-4t, 4 chips/host):
+#           NNODES_TRAINER=8 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=8 N_CHIPS_ROLLOUT=4 ROLLOUT_TP=4 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
+#       * On 4 x v6e-8 (ct6e-standard-8t, 8 chips/host, 2 x TP=4 sub-host replicas per host):
+#           NNODES_TRAINER=4 N_CHIPS_TRAINER=8 NNODES_ROLLOUT=4 N_CHIPS_ROLLOUT=8 ROLLOUT_TP=4 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
+#   - Whole-host alternative on 4 x v6e-8 (4 x TP=8, block_size=256, max_num_seqs=256):
+#       NNODES_TRAINER=4 N_CHIPS_TRAINER=8 NNODES_ROLLOUT=4 N_CHIPS_ROLLOUT=8 ROLLOUT_TP=8 ROLLOUT_MAX_NUM_SEQS=256 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
 
 set -xeuo pipefail
 
 export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
 export VERL_PLATFORM=tpu
+export VERL_USE_EXTERNAL_PLUGINS="${VERL_USE_EXTERNAL_PLUGINS:-none}"
 export TPU_ACCELERATOR_TYPE="${TPU_ACCELERATOR_TYPE:-v6e-32}"
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VLLM_USE_V1=0
@@ -59,6 +69,8 @@ sft_experiment_name="${SFT_EXPERIMENT_NAME:-multiturn-sft-qwen3-32b-tpu}"
 if [[ -z "${MODEL_PATH:-}" ]]; then
     if [[ -f "/dev/shm/checkpoint/${sft_experiment_name}/global_step_372/huggingface/model.safetensors.index.json" ]]; then
         model_path="/dev/shm/checkpoint/${sft_experiment_name}/global_step_372/huggingface"
+    elif [[ -f "/dev/shm/${sft_experiment_name}/global_step_372/huggingface/model.safetensors.index.json" ]]; then
+        model_path="/dev/shm/${sft_experiment_name}/global_step_372/huggingface"
     elif [[ -f "${HDFS_ROOT}/checkpoint/${sft_experiment_name}/global_step_372/huggingface/model.safetensors.index.json" ]]; then
         model_path="${HDFS_ROOT}/checkpoint/${sft_experiment_name}/global_step_372/huggingface"
     elif [[ -f "/tmp/multiturn-sft-qwen3-32b-tpu-hf/model.safetensors.index.json" ]]; then
@@ -130,6 +142,8 @@ export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 ROLLOUT_TP="${ROLLOUT_TP:-4}"
+ROLLOUT_BLOCK_SIZE="${ROLLOUT_BLOCK_SIZE:-256}"
+PARAMETER_SYNC_STEP="${PARAMETER_SYNC_STEP:-1}"
 
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-8}"
@@ -143,7 +157,13 @@ TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_NEVER}"
 RELEASE_SYNC_BUFFERS="${RELEASE_SYNC_BUFFERS:-True}"
 VERIFY_PARITY="${VERIFY_PARITY:-off}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}"
-ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-128}"
+if [[ -z "${ROLLOUT_MAX_NUM_SEQS:-}" ]]; then
+    if [[ "${ROLLOUT_TP}" -ge 8 ]]; then
+        ROLLOUT_MAX_NUM_SEQS=256
+    else
+        ROLLOUT_MAX_NUM_SEQS=128
+    fi
+fi
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}"
 
 # Off-policy correction for separate_async overlap
@@ -161,7 +181,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=separate_async \
     trainer.v1.separate_async.num_warmup_batches=1 \
-    trainer.v1.separate_async.parameter_sync_step=1 \
+    trainer.v1.separate_async.parameter_sync_step="${PARAMETER_SYNC_STEP}" \
     transfer_queue.enable=True \
     model_engine=torchtitan \
     algorithm.adv_estimator="${adv_estimator}" \
@@ -223,6 +243,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.block_size="${ROLLOUT_BLOCK_SIZE}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_model_len="${max_model_len}" \
     actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
