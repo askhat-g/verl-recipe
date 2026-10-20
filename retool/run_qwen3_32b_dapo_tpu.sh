@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ReTool Stage 2 (Multi-Turn DAPO RL with Code Interpreter) | Qwen3-32B | TorchTitan (SimpleFSDP=4, CP=8, DEFER_NEVER) & vLLM Rollout (8 x TP=4, block_size=256, Raiden) | TPU v6e 2x 32-Chip Nodepools
 #
-# Optimal 32-chip vLLM rollout settings (benchmarked on xibin-v6e-8-2):
-#   - Default (8 x TP=4, block_size=256, max_num_seqs=128):
-#       * On 8 x v6e-4 (ct6e-standard-4t, 4 chips/host):
-#           NNODES_TRAINER=8 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=8 N_CHIPS_ROLLOUT=4 ROLLOUT_TP=4 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
-#       * On 4 x v6e-8 (ct6e-standard-8t, 8 chips/host, 2 x TP=4 sub-host replicas per host):
-#           NNODES_TRAINER=4 N_CHIPS_TRAINER=8 NNODES_ROLLOUT=4 N_CHIPS_ROLLOUT=8 ROLLOUT_TP=4 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
-#   - Whole-host alternative on 4 x v6e-8 (4 x TP=8, block_size=256, max_num_seqs=256):
+# Optimal 64-chip (32 trainer + 32 rollout) settings benchmarked on xibin-v6e-8-2 (opt-v7, 51.47 tok/s/chip steady-state, 52.41 tok/s/chip peak):
+#   - Default on 4 x v6e-8 (ct6e-standard-8t, 8 chips/host; 32-chip trainer FSDP=4 x CP=8 + 32-chip rollout 8 x TP=4 sub-host replicas):
+#       bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
+#   - On 8 x v6e-4 (ct6e-standard-4t, 4 chips/host):
+#       NNODES_TRAINER=8 N_CHIPS_TRAINER=4 NNODES_ROLLOUT=8 N_CHIPS_ROLLOUT=4 ROLLOUT_TP=4 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
+#   - Whole-host rollout alternative on 4 x v6e-8 (4 x TP=8, block_size=256, max_num_seqs=256):
 #       NNODES_TRAINER=4 N_CHIPS_TRAINER=8 NNODES_ROLLOUT=4 N_CHIPS_ROLLOUT=8 ROLLOUT_TP=8 ROLLOUT_MAX_NUM_SEQS=256 bash recipe/retool/run_qwen3_32b_dapo_tpu.sh
 
 set -xeuo pipefail
@@ -23,6 +22,35 @@ export RAY_memory_monitor_refresh_ms=0
 export RAY_memory_usage_threshold=0.99
 export LIBTPU_INIT_ARGS="--xla_tpu_use_enhanced_launch_barrier=false"
 export VERL_TPU_SEQ_BUCKET_SIZE="${VERL_TPU_SEQ_BUCKET_SIZE:-18432}"
+export VERL_TPU_RESP_BUCKET_SIZE="${VERL_TPU_RESP_BUCKET_SIZE:-${VERL_TPU_SEQ_BUCKET_SIZE}}"
+export VERL_TPU_BSZ_BUCKET_SIZE="${VERL_TPU_BSZ_BUCKET_SIZE:-1}"
+export VERL_ENABLE_LOG_PROB_SPLITS="${VERL_ENABLE_LOG_PROB_SPLITS:-0}"
+export VERL_TPU_LOGPROBS_CHUNK_SIZE="${VERL_TPU_LOGPROBS_CHUNK_SIZE:-512}"
+export VERL_TPU_INFER_LOGPROBS_CHUNK_SIZE="${VERL_TPU_INFER_LOGPROBS_CHUNK_SIZE:-512}"
+export VERL_TPU_EAGER_FREE_LM_HEAD="${VERL_TPU_EAGER_FREE_LM_HEAD:-1}"
+export VERL_TPU_FUSE_PPO_LOSS="${VERL_TPU_FUSE_PPO_LOSS:-0}"
+export VERL_TPU_FUSE_LOGPROBS="${VERL_TPU_FUSE_LOGPROBS:-0}"
+export VERL_TPU_DEFER_OUTPUT_SYNC="${VERL_TPU_DEFER_OUTPUT_SYNC:-1}"
+export VERL_TPU_DEFER_METRIC_SYNC="${VERL_TPU_DEFER_METRIC_SYNC:-1}"
+export VERL_TPU_DETACH_ENTROPY="${VERL_TPU_DETACH_ENTROPY:-1}"
+export VERL_TPU_OPTIMIZER_EAGER_MODE="${VERL_TPU_OPTIMIZER_EAGER_MODE:-DEFER_AND_FUSE}"
+export VERL_TPU_VECTORIZE_GRAD_NORM="${VERL_TPU_VECTORIZE_GRAD_NORM:-1}"
+export VERL_TPU_FOREACH_GRAD_NORM="${VERL_TPU_FOREACH_GRAD_NORM:-1}"
+export VERL_TPU_FOREACH_CLIP_GRAD="${VERL_TPU_FOREACH_CLIP_GRAD:-1}"
+export VERL_TPU_LOCAL_QKV_SPLIT="${VERL_TPU_LOCAL_QKV_SPLIT:-1}"
+export VERL_RAIDEN_DIRECT_INSTALL="${VERL_RAIDEN_DIRECT_INSTALL:-1}"
+export VERL_RAIDEN_DIRECT_HOST_INSTALL="${VERL_RAIDEN_DIRECT_HOST_INSTALL:-${VERL_RAIDEN_DIRECT_INSTALL}}"
+export VERL_RAIDEN_TPU_TRANSPOSE="${VERL_RAIDEN_TPU_TRANSPOSE:-1}"
+export VERL_RAIDEN_INSTALL_THREADS="${VERL_RAIDEN_INSTALL_THREADS:-2}"
+export VERL_RAIDEN_SKIP_TILING="${VERL_RAIDEN_SKIP_TILING:-0}"
+if [[ -z "${LD_PRELOAD:-}" ]]; then
+    for _tcm in /usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 /usr/lib/x86_64-linux-gnu/libtcmalloc.so.4 /lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4; do
+        if [[ -f "${_tcm}" ]]; then
+            export LD_PRELOAD="${_tcm}"
+            break
+        fi
+    done
+fi
 export VERL_AGENT_LOOP_MAX_INFLIGHT_PROMPTS="${VERL_AGENT_LOOP_MAX_INFLIGHT_PROMPTS:-64}"
 export TORCH_LOGS="${TORCH_LOGS:-recompiles}"
 export TORCH_DYNAMO_RECOMPILE_LIMIT="${TORCH_DYNAMO_RECOMPILE_LIMIT:-64}"
@@ -134,24 +162,32 @@ n_resp_per_prompt="${N_RESP_PER_PROMPT:-16}"
 n_resp_per_prompt_val="${N_RESP_PER_PROMPT_VAL:-30}"
 
 # ================= TPU 2 x v6e-32 topology & performance (PR #62) =================
-export NNODES_TRAINER="${NNODES_TRAINER:-8}"
-export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-4}"
-export NNODES_ROLLOUT="${NNODES_ROLLOUT:-8}"
-export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-4}"
+export NNODES_TRAIN="${NNODES_TRAIN:-${NNODES_TRAINER:-4}}"
+export N_CHIPS_TRAIN="${N_CHIPS_TRAIN:-${N_CHIPS_TRAINER:-8}}"
+export NNODES_TRAINER="${NNODES_TRAINER:-${NNODES_TRAIN}}"
+export N_CHIPS_TRAINER="${N_CHIPS_TRAINER:-${N_CHIPS_TRAIN}}"
+export NNODES_ROLLOUT="${NNODES_ROLLOUT:-4}"
+export N_CHIPS_ROLLOUT="${N_CHIPS_ROLLOUT:-8}"
 
 TOTAL_TRAINER_CHIPS=$((NNODES_TRAINER * N_CHIPS_TRAINER))
 TOTAL_ROLLOUT_CHIPS=$((NNODES_ROLLOUT * N_CHIPS_ROLLOUT))
 ROLLOUT_TP="${ROLLOUT_TP:-4}"
 ROLLOUT_BLOCK_SIZE="${ROLLOUT_BLOCK_SIZE:-256}"
+ROLLOUT_ENABLE_PREFIX_CACHING="${ROLLOUT_ENABLE_PREFIX_CACHING:-True}"
 PARAMETER_SYNC_STEP="${PARAMETER_SYNC_STEP:-1}"
 
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-8}"
+TP_SIZE="${TP_SIZE:-${TENSOR_PARALLEL_SIZE:-1}}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-${TP_SIZE}}"
+CP_SIZE="${CP_SIZE:-${CONTEXT_PARALLEL_SIZE:-8}}"
+CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-${CP_SIZE}}"
 DEFAULT_DP_SHARD=$((TOTAL_TRAINER_CHIPS / (TENSOR_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE)))
-DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}"
+FSDP_SIZE="${FSDP_SIZE:-${DATA_PARALLEL_SHARD_SIZE:-${DEFAULT_DP_SHARD}}}"
+DATA_PARALLEL_SHARD_SIZE="${DATA_PARALLEL_SHARD_SIZE:-${FSDP_SIZE}}"
 
-actor_max_token_len_per_gpu="${ACTOR_MAX_TOKEN_LEN_PER_GPU:-$((max_model_len / CONTEXT_PARALLEL_SIZE))}"
-log_prob_max_token_len_per_gpu="${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-$((max_model_len / CONTEXT_PARALLEL_SIZE))}"
+ACTOR_MAX_TOKEN_LEN_PER_GPU="${ACTOR_MAX_TOKEN_LEN_PER_GPU:-$((max_model_len / CONTEXT_PARALLEL_SIZE))}"
+LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-$((2 * max_model_len / CONTEXT_PARALLEL_SIZE))}"
+actor_max_token_len_per_gpu="${ACTOR_MAX_TOKEN_LEN_PER_GPU}"
+log_prob_max_token_len_per_gpu="${LOG_PROB_MAX_TOKEN_LEN_PER_GPU}"
 torchtitan_max_seq_len=$(( (actor_max_token_len_per_gpu > log_prob_max_token_len_per_gpu ? actor_max_token_len_per_gpu : log_prob_max_token_len_per_gpu) * CONTEXT_PARALLEL_SIZE ))
 TPU_EAGER_MODE="${TPU_EAGER_MODE:-DEFER_NEVER}"
 RELEASE_SYNC_BUFFERS="${RELEASE_SYNC_BUFFERS:-True}"
@@ -241,7 +277,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.enable_prefix_caching=True \
+    actor_rollout_ref.rollout.enable_prefix_caching="${ROLLOUT_ENABLE_PREFIX_CACHING}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.block_size="${ROLLOUT_BLOCK_SIZE}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
