@@ -1,4 +1,5 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lightweight SandboxFusion-compatible HTTP server (/run_code) for ReTool multi-turn code execution."""
+"""Loopback SandboxFusion-compatible HTTP server (/run_code) for ReTool multi-turn code execution."""
 
 import argparse
 import asyncio
@@ -27,13 +28,29 @@ import urllib.request
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="SandboxFusion Local Server")
+# NOTE / TODO(security): This server executes model-generated Python snippets inside an isolated GKE TPU
+# training pod and binds strictly to loopback (127.0.0.1) so it is unreachable outside the local pod.
+# For multi-tenant or external network exposure, add bearer-token authentication and container/nsjail isolation.
+app = FastAPI(title="SandboxFusion Local Server", docs_url=None, redoc_url=None, openapi_url=None)
 
+ALLOWED_LANGUAGES = frozenset({"python", "python3"})
 MAX_CONCURRENT_PROCESSES = int(os.environ.get("SANDBOX_MAX_CONCURRENCY", "64"))
 _SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next) -> Response:
+    if request.method not in ("GET", "POST"):
+        return Response(status_code=405, content="Method Not Allowed")
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -44,10 +61,12 @@ def _get_semaphore() -> asyncio.Semaphore:
 
 
 class RunCodeRequest(BaseModel):
+    """Request schema matching SandboxFusion's /run_code endpoint."""
+
     compile_timeout: float = 10.0
     run_timeout: float = 30.0
-    code: str = ""
-    stdin: Optional[str] = ""
+    code: str = Field(default="", max_length=262144)
+    stdin: Optional[str] = Field(default="", max_length=262144)
     memory_limit_MB: int = 1024
     language: str = "python"
     files: dict[str, Any] = Field(default_factory=dict)
@@ -58,7 +77,7 @@ def _make_preexec_fn(memory_limit_mb: int):
     def _preexec():
         os.setsid()
         if memory_limit_mb and memory_limit_mb > 0:
-            # Allow virtual address space headroom for OpenBLAS/NumPy/SymPy shared libraries
+            # Allow virtual address space headroom for OpenBLAS/NumPy/SymPy shared libraries.
             limit_bytes = max(memory_limit_mb, 4096) * 1024 * 1024
             try:
                 resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
@@ -70,12 +89,14 @@ def _make_preexec_fn(memory_limit_mb: int):
 
 @app.get("/health")
 async def health() -> dict[str, str]:
+    """Return loopback server health status."""
     return {"status": "ok"}
 
 
 @app.post("/run_code")
 async def run_code(req: RunCodeRequest) -> dict[str, Any]:
-    if req.language not in ("python", "python3"):
+    """Execute a Python snippet inside an ephemeral temporary directory with timeout and RLIMIT_AS caps."""
+    if req.language not in ALLOWED_LANGUAGES:
         return {
             "status": "SandboxError",
             "message": f"Unsupported language: {req.language}",
@@ -164,19 +185,20 @@ async def run_code(req: RunCodeRequest) -> dict[str, Any]:
                     pass
                 return {
                     "status": "Failed",
-                    "message": str(exc),
+                    "message": "ExecutionError",
                     "compile_result": None,
                     "run_result": {
                         "status": "Error",
                         "execution_time": elapsed,
                         "return_code": -1,
                         "stdout": "",
-                        "stderr": f"{type(exc).__name__}: {exc}\n",
+                        "stderr": f"{type(exc).__name__}\n",
                     },
                 }
 
 
 def check_server(host: str = "127.0.0.1", port: int = 18080) -> bool:
+    """Verify the local SandboxFusion HTTP server responds cleanly to a smoke-test evaluation."""
     url = f"http://{host}:{port}/run_code"
     payload = json.dumps({"code": "print(6*7)", "run_timeout": 5}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
@@ -189,17 +211,23 @@ def check_server(host: str = "127.0.0.1", port: int = 18080) -> bool:
         return False
 
 
-def main():
-    parser = argparse.ArgumentParser(description="SandboxFusion-compatible local HTTP server")
-    parser.add_argument("--host", type=str, default="0.0.0.0")
+def main() -> None:
+    """CLI entry point for starting or probing the loopback SandboxFusion server."""
+    parser = argparse.ArgumentParser(description="SandboxFusion-compatible loopback HTTP server")
+    parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--check", action="store_true", help="Check if local server is healthy and exit")
     args = parser.parse_args()
     if args.check:
         target_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
         sys.exit(0 if check_server(target_host, args.port) else 1)
-    uvicorn.run(app, host=args.host, port=args.port, workers=args.workers, log_level="warning")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    existing_py_path = os.environ.get("PYTHONPATH", "")
+    if script_dir not in existing_py_path.split(os.pathsep):
+        os.environ["PYTHONPATH"] = f"{script_dir}{os.pathsep}{existing_py_path}" if existing_py_path else script_dir
+    target: Any = "sandbox_fusion_server:app" if args.workers > 1 else app
+    uvicorn.run(target, host=args.host, port=args.port, workers=args.workers, app_dir=script_dir, log_level="warning")
 
 
 if __name__ == "__main__":
