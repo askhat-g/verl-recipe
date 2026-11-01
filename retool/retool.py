@@ -1,4 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,8 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""ReTool multi-turn code-interpreter tool, dataset loader, and reward function."""
+
+import argparse
+import importlib
 import logging
 import re
+import sys
 from typing import Any
 
 import datasets
@@ -28,13 +34,19 @@ logger = logging.getLogger(__name__)
 
 
 class CustomSandboxFusionTool(SandboxFusionTool):
+    """SandboxFusion code-interpreter tool that strips markdown fences and auto-prints final expressions."""
+
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
         self.code_pattern = re.compile(r"```python(.*?)```", re.DOTALL)
 
     @rollout_trace_op
-    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[str, float, dict]:
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[str, Any, Any]:
+        """Execute a generated Python snippet in the local SandboxFusion server."""
         code = parameters["code"]
+        if not isinstance(code, str):
+            code = str(code)
+
         matches = self.code_pattern.findall(code)
         if matches:
             code = matches[0].strip()
@@ -51,8 +63,6 @@ class CustomSandboxFusionTool(SandboxFusionTool):
 
         timeout = parameters.get("timeout", self.default_timeout)
         language = parameters.get("language", self.default_language)
-        if not isinstance(code, str):
-            code = str(code)
 
         result = await self.execution_pool.execute.remote(self.execute_code, instance_id, code, timeout, language)
         # sandbox has no score or metrics, use Nones
@@ -80,7 +90,9 @@ class CustomRLHFDataset(RLHFDataset):
         print(f"dataset len: {len(self.dataframe)}")
 
 
-def compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs):
+def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info: dict[str, Any], **kwargs) -> dict:
+    """Compute ReTool boxed-math score with auxiliary multi-turn tool-usage shaping on incorrect rollouts."""
+    del data_source, kwargs
     # use \\boxed{...} answer
     result = math_dapo.compute_score(solution_str, ground_truth, strict_box_verify=True)
 
@@ -94,3 +106,26 @@ def compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
         result["pred"] = ""
 
     return result
+
+
+def supports_raiden_unbind_weights() -> bool:
+    """Return True when the installed tpu-sync-torch WeightSynchronizer exposes unbind_weights()."""
+    try:
+        mod = importlib.import_module("tpu_sync.api.torch.weight_synchronizer")
+        return hasattr(getattr(mod, "WeightSynchronizer", None), "unbind_weights")
+    except ImportError:
+        return False
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(description="ReTool helper utilities")
+    parser.add_argument(
+        "--check-raiden-unbind", action="store_true", help="Exit 0 if WeightSynchronizer.unbind_weights exists"
+    )
+    args = parser.parse_args()
+    if args.check_raiden_unbind:
+        sys.exit(0 if supports_raiden_unbind_weights() else 1)
+
+
+if __name__ == "__main__":
+    _main()
