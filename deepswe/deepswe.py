@@ -13,21 +13,21 @@
 # limitations under the License.
 """DeepSWE recipe hooks for 2-slot lookahead Kubernetes sandbox pre-warming and pinned evaluation pools.
 
-This module lives inside the DeepSWE recipe folder (``examples/tpu/deepswe/deepswe.py``, to be migrated to
-``verl-recipe/deepswe/``) so core ``verl`` trainer files remain untouched.
+This module lives in the DeepSWE recipe folder (``verl-recipe/deepswe/deepswe.py``) and is loaded through
+``VERL_USE_EXTERNAL_MODULES`` so core ``verl`` trainer files remain untouched.
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
 import logging
 import os
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
-from tensordict import TensorDict
 import torch
+from tensordict import TensorDict
 
 from verl.trainer.ppo.core_algos import ADV_ESTIMATOR_REGISTRY, register_adv_est
 from verl.trainer.ppo.v1.trainer_base import TRAINER_REGISTRY, PPOTrainer
@@ -191,10 +191,7 @@ class _DeepSWESandboxLookaheadMixin:
             wait_eval_sandbox_images_ready()
 
     def _finish_sampled_sandbox_batch(self: PPOTrainer) -> None:
-        if (
-            self._prewarm_batch_iterator is not None
-            and self.local_trigger_step == self.parameter_sync_step - 1
-        ):
+        if self._prewarm_batch_iterator is not None and self.local_trigger_step == self.parameter_sync_step - 1:
             self._prewarm_batch_iterator.finish_oldest_inflight_batch(wait=False)
 
     def _close_sandbox_lookahead(self: PPOTrainer) -> None:

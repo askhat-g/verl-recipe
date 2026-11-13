@@ -12,7 +12,7 @@ Below is each resource you need to have in place, what it is used for, how it sh
 The GKE cluster hosts both the Ray TPU job and the container sandboxes. It needs the **Cloud Storage FUSE CSI driver** (`GcsFuseCsiDriver`) so TPU worker pods can mount your GCS bucket at `/data` to read the model checkpoint and dataset, and **Workload Identity** so pods can authenticate to GCS and Artifact Registry without static keys.
 
 ### How it should look
-- A Regional or Zonal GKE cluster in the same region as your TPU capacity and Artifact Registry mirror (for example, `europe-west4` for TPU v5p or `us-central1` for TPU v7x).
+- A Regional or Zonal GKE cluster in the same region as your TPU capacity and Artifact Registry mirror (for example, `us-central1` for TPU v7x).
 - Addons enabled: `GcsFuseCsiDriver` (and optionally `RayOperator` if using `RayCluster` CRDs).
 - Workload Identity pool enabled: `<PROJECT>.svc.id.goog`.
 - A small default/system CPU node pool (e.g., 1–2 `n2-standard-16` nodes) to host the Ray Head pod, which coordinates the cluster and requires ~12 vCPUs and 48 GiB of memory.
@@ -23,7 +23,7 @@ export PROJECT="<GCP_PROJECT>"
 export REGION="<REGION>"          # e.g., europe-west4 or us-central1
 export ZONE="<ZONE>"              # e.g., europe-west4-b
 export CLUSTER="<CLUSTER_NAME>"
-export NAMESPACE="trellis"        # or "default"
+export NAMESPACE="<NAMESPACE>"    # e.g., "default"
 
 gcloud container clusters create "${CLUSTER}" \
   --project="${PROJECT}" \
@@ -76,26 +76,11 @@ gcloud container node-pools create sandbox-cpu-pool \
 
 ### How they should look
 - **Two identical TPU slices** in the same cluster: one for the trainer (`tpu-group-0`) and one for the rollout server (`tpu-group-1`).
-- **For TPU v5p**: Two 16-chip slices (`ct5p-hightpu-4t`, topology `2x2x4`, 4 hosts x 4 chips per slice = 16 chips per slice, 32 chips total).
-- **For TPU v7x**: Two 4-chip / 8-TensorCore slices (`tpu7x-standard-4t`, topology `2x2x1`, 1 host x 8 TensorCores per slice) or two 8-chip / 16-TensorCore slices (`2x2x2`, 2 hosts per slice).
+- **TPU v7x**: Two 4-chip / 8-TensorCore slices (`tpu7x-standard-4t`, topology `2x2x1`, 1 host x 8 TensorCores per slice) or two 8-chip / 16-TensorCore slices (`2x2x2`, 2 hosts per slice).
 
 ### Suggested commands
 ```bash
-# Option A: Two 16-chip TPU v5p slices (4 hosts per slice, 2x2x4 topology)
-for SLICE in trainer-v5p-slice rollout-v5p-slice; do
-  gcloud container node-pools create "${SLICE}" \
-    --cluster="${CLUSTER}" \
-    --project="${PROJECT}" \
-    --region="${REGION}" \
-    --node-locations="${ZONE}" \
-    --machine-type=ct5p-hightpu-4t \
-    --tpu-topology=2x2x4 \
-    --num-nodes=4 \
-    --workload-metadata=GKE_METADATA \
-    --scopes=cloud-platform
-done
-
-# Option B: Two TPU v7x slices (1 host per slice, 2x2x1 topology)
+# Two TPU v7x slices (1 host per slice, 2x2x1 topology)
 for SLICE in trainer-v7x-slice rollout-v7x-slice; do
   gcloud container node-pools create "${SLICE}" \
     --cluster="${CLUSTER}" \
@@ -118,7 +103,7 @@ done
 
 ### How it should look
 - **CRDs & Controller**: `sandboxes.agents.x-k8s.io`, `sandboxtemplates.extensions.agents.x-k8s.io`, `sandboxwarmpools.extensions.agents.x-k8s.io`, and `sandboxclaims.extensions.agents.x-k8s.io` installed in the cluster, with `agent-sandbox-controller` running in `agent-sandbox-system`.
-- **RBAC (`Role` + `RoleBinding`)**: In the namespace where your Ray pods run (e.g., `trellis` or `default`), the ServiceAccount used by your Ray pods (`xpk-sa` or `default`) must have `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` on `pods`, `services`, `sandboxes`, `sandboxtemplates`, `sandboxwarmpools`, and `sandboxclaims`, plus `get` and `create` on `pods/exec` and `pods/log`.
+- **RBAC (`Role` + `RoleBinding`)**: In the namespace where your Ray pods run (e.g., `default`), the ServiceAccount used by your Ray pods (`xpk-sa` or `default`) must have `get`, `list`, `watch`, `create`, `update`, `patch`, `delete` on `pods`, `services`, `sandboxes`, `sandboxtemplates`, `sandboxwarmpools`, and `sandboxclaims`, plus `get` and `create` on `pods/exec` and `pods/log`.
 
 ### Suggested commands
 Check if the CRDs already exist, and install them if missing:
@@ -188,7 +173,7 @@ EOF
 Each row in the R2E-Gym dataset specifies a Docker Hub image (`namanjain12/<repo>_final:<commit>`). If dozens of GKE nodes pull those multi-gigabyte images directly from Docker Hub at once, Docker Hub blocks the pulls with `429 Too Many Requests` rate-limit errors. Hosting a mirror of the 8 R2E-Gym repositories (`aiohttp_final`, `datalad_final`, `numpy_final`, `pandas_final`, `pillow_final`, `pyramid_final`, `scrapy_final`, `tornado_final`) in a regional Artifact Registry repository lets `K8sAgentSandbox` rewrite `namanjain12/*` to your regional mirror via `SANDBOX_IMAGE_PREFIX`.
 
 ### How it should look
-- An Artifact Registry Docker repository in the same region as your cluster (for example, `europe-west4-docker.pkg.dev/cloud-tpu-multipod-dev/tunix`) containing the mirrored `<repo>_final:<commit>` tags.
+- An Artifact Registry Docker repository in the same region as your cluster (for example, `us-central1-docker.pkg.dev/<PROJECT>/<REPO>`) containing the mirrored `<repo>_final:<commit>` tags.
 - Pass `SANDBOX_IMAGE_PREFIX="<REGION>-docker.pkg.dev/<PROJECT>/<REPO>"` when launching the job.
 
 ---
@@ -207,12 +192,14 @@ Under your GCS bucket `gs://<BUCKET>/<USER_DIR>` (which maps to `RAY_DATA_HOME=/
 ### Suggested commands
 ```bash
 export BUCKET="<GCS_BUCKET>"
-export USER_DIR="aaskhat"
+export USER_DIR="<USER_DIR>"
 
-# 1. Clone the three PR branches
-git clone -b feat/deepswe-qwen3_5-35b-v7x https://github.com/askhat-g/verl.git
-git clone -b feat/deepswe-qwen3_5-35b-v7x https://github.com/askhat-g/verl-hardware-plugin.git
-git clone -b feat/deepswe-qwen3_5-35b-v7x https://github.com/askhat-g/uni-agent.git
+# 1. Clone verl main, verl-hardware-plugin main, uni-agent (K8sAgentSandbox + R2E-Gym), and this recipe
+git clone https://github.com/verl-project/verl.git
+git clone https://github.com/verl-project/verl-hardware-plugin.git
+git clone -b feat/deepswe-main https://github.com/askhat-g/uni-agent.git
+git clone https://github.com/verl-project/verl-recipe.git
+mkdir -p verl/recipe && cp -r verl-recipe/deepswe verl/recipe/deepswe
 
 # 2. Preprocess R2E-Gym into Parquet files and upload to GCS
 PYTHONPATH=uni-agent:verl python3 -m uni_agent.tasks.r2e_gym.preprocess \
@@ -222,7 +209,7 @@ gcloud storage cp -r /tmp/r2e_gym_easy "gs://${BUCKET}/${USER_DIR}/data/"
 # 3. Upload the text-only Qwen3.5-35B-A3B checkpoint to GCS
 gcloud storage cp -r /path/to/Qwen3.5-35B-A3B "gs://${BUCKET}/${USER_DIR}/assets/hf/"
 
-# 4. Bundle and upload the three repositories
+# 4. Bundle and upload the repositories (the recipe is inside verl/recipe/deepswe)
 tar -czf /tmp/deepswe_bundle.tar.gz \
   --exclude='.git' --exclude='__pycache__' \
   uni-agent verl verl-hardware-plugin
@@ -247,11 +234,11 @@ The `JobSet` starts the Ray cluster across your pods: 1 Ray head pod on the CPU 
 ### Suggested commands
 Apply your `JobSet` manifest and verify all pods join Ray:
 ```bash
-kubectl apply -f verl-nap-aaskhat-deepswe-jobset.yaml
-kubectl get pods -n "${NAMESPACE}" -l jobset.sigs.k8s.io/jobset-name=verl-nap-aaskhat-deepswe
+kubectl apply -f verl-deepswe-jobset.yaml
+kubectl get pods -n "${NAMESPACE}" -l jobset.sigs.k8s.io/jobset-name=verl-deepswe
 
 HEAD_POD=$(kubectl get pods -n "${NAMESPACE}" \
-  -l jobset.sigs.k8s.io/jobset-name=verl-nap-aaskhat-deepswe,verl-nap/role=head \
+  -l jobset.sigs.k8s.io/jobset-name=verl-deepswe,role=head \
   -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n "${NAMESPACE}" "${HEAD_POD}" -- ray status
 ```
@@ -302,7 +289,7 @@ kubectl exec -n "${NAMESPACE}" "${HEAD_POD}" -- \
     export MAX_MODEL_LEN=65536 &&
     export PAD_TO_LENGTH_BUCKET=4096 &&
     export SANDBOX_NAMESPACE='${NAMESPACE}' &&
-    export SANDBOX_IMAGE_PREFIX='us-central1-docker.pkg.dev/cloud-tpu-multipod-dev/tunix' &&
+    export SANDBOX_IMAGE_PREFIX='<REGION>-docker.pkg.dev/<PROJECT>/<REPO>' &&
     export NODE_SELECTOR_KEY='cloud.google.com/gke-nodepool' &&
     export NODE_SELECTOR_VAL='sandbox-cpu-pool' &&
     exec bash /tmp/deepswe_src/verl/recipe/deepswe/run_qwen3_5_35b_deepswe.sh \
