@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DeepSWE recipe hooks for 2-slot lookahead Kubernetes sandbox pre-warming and pinned evaluation pools.
+"""DeepSWE recipe hooks for 2-slot lookahead Kubernetes sandbox pre-warming and just-in-time evaluation pools.
 
 This module lives in the DeepSWE recipe folder (``verl-recipe/deepswe/deepswe.py``) and is loaded through
 ``VERL_USE_EXTERNAL_MODULES`` so core ``verl`` trainer files remain untouched.
@@ -42,9 +42,7 @@ try:
         ensure_lookahead_batch_warm,
         extract_sandbox_images,
         finish_lookahead_batch_async,
-        pin_eval_sandbox_images,
         prefetch_lookahead_batch_async,
-        wait_eval_sandbox_images_ready,
     )
 except ImportError:
     PrewarmBatchIterator = None  # type: ignore[assignment]
@@ -52,9 +50,7 @@ except ImportError:
     ensure_lookahead_batch_warm = None  # type: ignore[assignment]
     extract_sandbox_images = None  # type: ignore[assignment]
     finish_lookahead_batch_async = None  # type: ignore[assignment]
-    pin_eval_sandbox_images = None  # type: ignore[assignment]
     prefetch_lookahead_batch_async = None  # type: ignore[assignment]
-    wait_eval_sandbox_images_ready = None  # type: ignore[assignment]
 
 try:
     from uni_agent.framework.entry import AgentFrameworkRolloutAdapter
@@ -127,16 +123,26 @@ def compute_grpo_loo_outcome_advantage(
 
 
 class _DeepSWESandboxLookaheadMixin:
-    """Mixin adding 2-slot ``PrewarmBatchIterator`` lookahead and pinned eval pools to ``PPOTrainer``."""
+    """Mixin adding 2-slot ``PrewarmBatchIterator`` lookahead and just-in-time eval sandbox warming to ``PPOTrainer``.
+
+    Evaluation sandboxes are not kept warm for the whole run. They start warming in the background once the rollouts
+    of a step that ends in validation are sampled (so they warm during that step's update and weight sync), validation
+    waits for them, and they are released as soon as validation ends.
+    """
 
     _prewarm_batch_iterator: PrewarmBatchIterator | None = None
     _sandbox_lookahead_initialized: bool = False
+    _eval_sandbox_images: list[str] | None = None
+    _eval_sandbox_replicas: int = 1
+    _eval_sandbox_batch_id: str | None = None
 
     def _init_sandbox_lookahead(self: PPOTrainer) -> None:
         if getattr(self, "_sandbox_lookahead_initialized", False):
             return
         self._sandbox_lookahead_initialized = True
         self._prewarm_batch_iterator = None
+        self._eval_sandbox_images = None
+        self._eval_sandbox_batch_id = None
 
         if (
             PrewarmBatchIterator is None
@@ -149,26 +155,13 @@ class _DeepSWESandboxLookaheadMixin:
         if os.getenv("VERL_SANDBOX_LOOKAHEAD", "1").strip().lower() in ("0", "false", "no"):
             return
 
-        eval_images = extract_sandbox_images(self.val_dataset)
-        if eval_images and pin_eval_sandbox_images is not None:
-            val_n = int(
-                os.getenv(
-                    "SANDBOX_EVAL_REPLICAS",
-                    str(self.config.actor_rollout_ref.rollout.val_kwargs.get("n", 1) or 1),
-                )
+        self._eval_sandbox_images = extract_sandbox_images(self.val_dataset) or None
+        self._eval_sandbox_replicas = int(
+            os.getenv(
+                "SANDBOX_EVAL_REPLICAS",
+                str(self.config.actor_rollout_ref.rollout.val_kwargs.get("n", 1) or 1),
             )
-            val_before_train = bool(self.config.trainer.get("val_before_train", True))
-            logger.info(
-                "Pinning %d unique evaluation sandbox images (replicas=%d, wait=%s)",
-                len(set(eval_images)),
-                val_n,
-                val_before_train,
-            )
-            pin_eval_sandbox_images(
-                eval_images,
-                replicas_override=val_n,
-                wait=val_before_train,
-            )
+        )
 
         rollout_n = int(self.config.actor_rollout_ref.rollout.get("n", 8) or 8)
         self._prewarm_batch_iterator = PrewarmBatchIterator(
@@ -185,16 +178,62 @@ class _DeepSWESandboxLookaheadMixin:
         if self._prewarm_batch_iterator is not None:
             self._prewarm_batch_iterator.prime()
 
+    def _step_ends_in_validation(self: PPOTrainer) -> bool:
+        """Mirror ``PPOTrainer._fit``: validation follows the last step and every ``test_freq``-th step."""
+        test_freq = int(self.config.trainer.get("test_freq", 0) or 0)
+        if test_freq <= 0:
+            return False
+        return self.global_steps >= self.total_training_steps or self.global_steps % test_freq == 0
+
+    def _prefetch_eval_sandboxes(self: PPOTrainer) -> None:
+        """Start warming the evaluation sandboxes in the background ahead of this step's validation."""
+        if (
+            self._prewarm_batch_iterator is None
+            or not self._eval_sandbox_images
+            or self._eval_sandbox_batch_id is not None
+            or not self._step_ends_in_validation()
+        ):
+            return
+        self._eval_sandbox_batch_id = f"eval_step_{self.global_steps}"
+        logger.info(
+            "Pre-warming %d evaluation sandbox images for validation at step %d (replicas=%d)",
+            len(set(self._eval_sandbox_images)),
+            self.global_steps,
+            self._eval_sandbox_replicas,
+        )
+        prefetch_lookahead_batch_async(
+            self._eval_sandbox_batch_id,
+            self._eval_sandbox_images,
+            replicas_override=self._eval_sandbox_replicas,
+        )
+
     def _wait_eval_sandboxes_ready(self: PPOTrainer) -> None:
+        """Block until the evaluation sandboxes are Ready, warming them now if no prefetch was started."""
         self._init_sandbox_lookahead()
-        if self._prewarm_batch_iterator is not None and wait_eval_sandbox_images_ready is not None:
-            wait_eval_sandbox_images_ready()
+        if self._prewarm_batch_iterator is None or not self._eval_sandbox_images:
+            return
+        if self._eval_sandbox_batch_id is None:
+            self._eval_sandbox_batch_id = f"eval_step_{self.global_steps}"
+        ensure_lookahead_batch_warm(
+            self._eval_sandbox_batch_id,
+            self._eval_sandbox_images,
+            replicas_override=self._eval_sandbox_replicas,
+            wait=True,
+        )
+
+    def _release_eval_sandboxes(self: PPOTrainer) -> None:
+        """Retire the evaluation sandbox batch so its warm pools are torn down after validation."""
+        batch_id, self._eval_sandbox_batch_id = getattr(self, "_eval_sandbox_batch_id", None), None
+        if batch_id is not None and finish_lookahead_batch_async is not None:
+            finish_lookahead_batch_async(batch_id, wait=False)
 
     def _finish_sampled_sandbox_batch(self: PPOTrainer) -> None:
         if self._prewarm_batch_iterator is not None and self.local_trigger_step == self.parameter_sync_step - 1:
             self._prewarm_batch_iterator.finish_oldest_inflight_batch(wait=False)
+            self._prefetch_eval_sandboxes()
 
     def _close_sandbox_lookahead(self: PPOTrainer) -> None:
+        self._eval_sandbox_batch_id = None
         if close_lookahead_warmer is not None:
             close_lookahead_warmer()
 
@@ -252,6 +291,12 @@ class DeepSWESeparateAsyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSe
         self._wait_eval_sandboxes_ready()
         super().on_validate_begin()
 
+    def on_validate_end(self) -> None:
+        try:
+            super().on_validate_end()
+        finally:
+            self._release_eval_sandboxes()
+
     def on_sample_end(self) -> None:
         self._finish_sampled_sandbox_batch()
         super().on_sample_end()
@@ -284,6 +329,12 @@ class DeepSWESyncPPOTrainer(_DeepSWESandboxLookaheadMixin, PPOTrainerSync):
     def on_validate_begin(self) -> None:
         self._wait_eval_sandboxes_ready()
         super().on_validate_begin()
+
+    def on_validate_end(self) -> None:
+        try:
+            super().on_validate_end()
+        finally:
+            self._release_eval_sandboxes()
 
     def on_sample_end(self) -> None:
         self._finish_sampled_sandbox_batch()
